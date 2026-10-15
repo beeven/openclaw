@@ -15,7 +15,7 @@ concurrency:
 jobs:
   build:
     if: github.repository == 'beeven/openclaw'
-    runs-on: xcode-27
+    runs-on: macos-26-intel
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -34,18 +34,11 @@ jobs:
           install-deps: "false"
           install-bun: "false"
 
-      - name: Package ARM64 debug app
-        id: package
-        env:
-          BUILD_CONFIG: debug
-          BUILD_ARCHS: arm64
-          ALLOW_ADHOC_SIGNING: "1"
-          SIGN_IDENTITY: "-"
-          SKIP_TEAM_ID_CHECK: "1"
+      - name: Install packaging dependencies and prepare native resources
         run: |
           set -o pipefail
-          /bin/bash scripts/package-mac-app.sh 2>&1 | tee "$RUNNER_TEMP/darkwake-package.log"
-          ditto -c -k --sequesterRsrc --keepParent dist/OpenClaw.app dist/OpenClaw-darkwake-arm64.zip
+          pnpm install --frozen-lockfile --config.node-linker=hoisted 2>&1 | tee "$RUNNER_TEMP/darkwake-install.log"
+          node scripts/prepare-apple-mermaid.mjs 2>&1 | tee "$RUNNER_TEMP/darkwake-resources.log"
 
       - name: Build native tests
         run: |
@@ -61,12 +54,26 @@ jobs:
             --filter 'MacGatewayPowerMonitorTests|GatewayChildSupervisorTests|GatewaySleepCycleControllerTests|GatewayProcessManagerTests' \
             2>&1 | tee "$RUNNER_TEMP/darkwake-tests.log"
 
+      - name: Package Intel debug app
+        id: package
+        env:
+          SKIP_PNPM_INSTALL: "1"
+          BUILD_CONFIG: debug
+          BUILD_ARCHS: x86_64
+          ALLOW_ADHOC_SIGNING: "1"
+          SIGN_IDENTITY: "-"
+          SKIP_TEAM_ID_CHECK: "1"
+        run: |
+          set -o pipefail
+          /bin/bash scripts/package-mac-app.sh 2>&1 | tee "$RUNNER_TEMP/darkwake-package.log"
+          ditto -c -k --sequesterRsrc --keepParent dist/OpenClaw.app dist/OpenClaw-darkwake-x86_64.zip
+
       - name: Upload trial app
         if: ${{ !cancelled() && steps.package.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: OpenClaw-darkwake-arm64-${{ github.sha }}
-          path: dist/OpenClaw-darkwake-arm64.zip
+          name: OpenClaw-darkwake-x86_64-${{ github.sha }}
+          path: dist/OpenClaw-darkwake-x86_64.zip
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
