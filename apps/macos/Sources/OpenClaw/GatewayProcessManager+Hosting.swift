@@ -333,6 +333,9 @@ extension GatewayProcessManager {
             }
             guard self.isCurrentGatewayStart(startGeneration) else { return }
             await self.observeChildReadiness(pid: pid, port: port, generation: startGeneration)
+        } catch is GatewayChildSupervisor.DeferredForPower {
+            guard self.isCurrentGatewayStart(startGeneration) else { return }
+            self.deferStartForPower()
         } catch {
             guard self.isCurrentGatewayStart(startGeneration) else { return }
             self.fail(error.localizedDescription)
@@ -357,6 +360,8 @@ extension GatewayProcessManager {
         case let .restarting(delay):
             self.status = .starting
             self.appendLog("[gateway] child exited; restarting in \(delay)\n")
+        case .deferredForPower:
+            self.deferStartForPower()
         case let .failed(reason):
             self.terminalChildFailureGeneration = generation
             self.desiredActive = false

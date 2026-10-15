@@ -161,7 +161,9 @@ final class GatewayProcessManager {
     var gatewayStartTask: Task<Void, Never>?
     private var gatewayStartTaskGeneration: UInt64?
     private var gatewayStartTaskID: UUID?
-    let childSupervisor = GatewayChildSupervisor()
+    let childSupervisor: GatewayChildSupervisor
+    private let canLaunchGateway: @MainActor () -> Bool
+    private var startDeferredForPower = false
     var bundledUpdateTask: Task<BundledRuntimeUpdateResult, Error>?
     var bundledUpdateTaskID: UUID?
     var hostingChangeTask: Task<Void, Error>?
@@ -180,8 +182,13 @@ final class GatewayProcessManager {
     private let environmentRefreshMinInterval: TimeInterval = 30
     let readinessClock: any Clock<Duration>
 
-    init(readinessClock: any Clock<Duration> = ContinuousClock()) {
+    init(
+        readinessClock: any Clock<Duration> = ContinuousClock(),
+        canLaunchGateway: @escaping @MainActor () -> Bool = { MacGatewayPowerMonitor.shared.allowsGatewayLaunch })
+    {
         self.readinessClock = readinessClock
+        self.canLaunchGateway = canLaunchGateway
+        self.childSupervisor = GatewayChildSupervisor(canLaunch: canLaunchGateway)
     }
 
     var hostsLocalGatewayWithRemotePrimary: Bool {
@@ -513,6 +520,14 @@ final class GatewayProcessManager {
 
     func startIfNeeded() {
         guard self.desiredActive, !self.isTerminating, !self.hostingChangeInProgress else { return }
+        if self.gatewayHosting == .app, !self.canLaunchGateway() {
+            switch self.status {
+            case .running, .attachedExisting: return
+            case .stopped, .starting, .failed: break
+            }
+            self.deferStartForPower()
+            return
+        }
         do {
             try self.loadRetainedServiceForResume()
         } catch {
@@ -545,6 +560,7 @@ final class GatewayProcessManager {
             break
         }
         self.status = .starting
+        self.startDeferredForPower = false
         self.gatewayStartGeneration &+= 1
         let startGeneration = self.gatewayStartGeneration
         self.logger.debug("gateway start requested")
@@ -602,6 +618,7 @@ final class GatewayProcessManager {
         expectedServiceAuthority: GatewayLaunchAgentManager.ServiceAuthority? = nil,
         mutationCheck: (@MainActor @Sendable () async throws -> Void)? = nil)
     {
+        self.startDeferredForPower = false
         self.nodeMigrationCompleted = false
         self.nodeMigrationVersionUpdated = false
         self.gatewayStartGeneration &+= 1
@@ -735,6 +752,7 @@ final class GatewayProcessManager {
             return !Task.isCancelled && self.launchAgentEnableCurrentRequest?.nodeMigration != nil &&
                 self.launchAgentEnableCurrentRequest?.generation == context.generation
         }
+        if self.startDeferredForPower { return false }
         if case .child = context.purpose,
            self.childSupervisor.processIdentifier != context.readinessPID
         { return false }
@@ -1363,6 +1381,41 @@ extension GatewayProcessManager {
         let text = String(data: data, encoding: .utf8) ?? ""
         if text.count <= limit { return text }
         return String(text.suffix(limit))
+    }
+}
+
+extension GatewayProcessManager {
+    func deferStartForPower() {
+        if !self.startDeferredForPower {
+            self.appendLog("[gateway] startup deferred until the Mac leaves sleep or DarkWake\n")
+        }
+        self.startDeferredForPower = true
+        self.status = .stopped
+    }
+
+    func gatewayWillSleep() {
+        guard self.gatewayHosting == .app, self.status == .starting else { return }
+        // Preserve the child and activation intent. A sleeping host cannot spend
+        // the readiness deadline; wake starts a fresh probe or resumes supervision.
+        if !self.childSupervisor.isActive || self.childSupervisor.processIdentifier != nil {
+            self.gatewayStartTask?.cancel()
+        }
+        self.deferStartForPower()
+    }
+
+    func resumeStartAfterWake() async {
+        // Initial spawn may still be returning its PID. Join it rather than
+        // terminating that child or competing with its readiness observation.
+        await self.gatewayStartTask?.value
+        guard self.startDeferredForPower, self.canLaunchGateway() else { return }
+        guard self.desiredActive, !self.isTerminating, !self.hostingChangeInProgress else { return }
+        self.startDeferredForPower = false
+        if self.childSupervisor.isActive, self.childSupervisor.processIdentifier == nil {
+            // The existing supervisor still owns its backoff and next child.
+            self.status = .starting
+            return
+        }
+        self.startIfNeeded()
     }
 }
 

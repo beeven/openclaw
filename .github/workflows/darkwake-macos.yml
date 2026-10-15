@@ -1,0 +1,81 @@
+name: DarkWake macOS trial build
+
+on:
+  push:
+    branches: [codex/darkwake-gateway]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: darkwake-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.repository == 'beeven/openclaw'
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Select and verify Xcode
+        run: |
+          source scripts/lib/swift-toolchain.sh
+          select_xcode_toolchain
+          require_swift_toolchain
+
+      - uses: ./.github/actions/setup-node-env
+        with:
+          node-version: 26.x
+          install-deps: "false"
+          install-bun: "false"
+
+      - name: Package ARM64 debug app
+        id: package
+        env:
+          BUILD_CONFIG: debug
+          BUILD_ARCHS: arm64
+          ALLOW_ADHOC_SIGNING: "1"
+          SIGN_IDENTITY: "-"
+          SKIP_TEAM_ID_CHECK: "1"
+        run: |
+          set -o pipefail
+          /bin/bash scripts/package-mac-app.sh 2>&1 | tee "$RUNNER_TEMP/darkwake-package.log"
+          ditto -c -k --sequesterRsrc --keepParent dist/OpenClaw.app dist/OpenClaw-darkwake-arm64.zip
+
+      - name: Build native tests
+        run: |
+          set -o pipefail
+          swift build --package-path apps/macos --build-system native --build-tests --jobs 2 \
+            --disable-index-store -Xswiftc -gline-tables-only 2>&1 | tee "$RUNNER_TEMP/darkwake-test-build.log"
+
+      - name: Run Gateway lifecycle regressions
+        run: |
+          set -o pipefail
+          node scripts/test-macos-native.mts default \
+            --package-path apps/macos --build-system native --skip-build \
+            --filter 'MacGatewayPowerMonitorTests|GatewayChildSupervisorTests|GatewaySleepCycleControllerTests|GatewayProcessManagerTests' \
+            2>&1 | tee "$RUNNER_TEMP/darkwake-tests.log"
+
+      - name: Upload trial app
+        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: OpenClaw-darkwake-arm64-${{ github.sha }}
+          path: dist/OpenClaw-darkwake-arm64.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: darkwake-build-logs-${{ github.sha }}
+          path: ${{ runner.temp }}/darkwake-*.log
+          if-no-files-found: ignore
+          retention-days: 7

@@ -1,4 +1,3 @@
-import AppKit
 import Foundation
 import Observation
 import OpenClawProtocol
@@ -32,7 +31,6 @@ final class GatewayConnectivityCoordinator {
     static let shared = GatewayConnectivityCoordinator()
 
     private var endpointTask: Task<Void, Never>?
-    private var workspaceObservers: [NSObjectProtocol] = []
     private var endpointTransition = GatewayEndpointTransition()
     @ObservationIgnored private var sleepCycleController: GatewaySleepCycleController?
 
@@ -100,20 +98,21 @@ final class GatewayConnectivityCoordinator {
     }
 
     private func registerSleepWakeObservers() {
-        let center = NSWorkspace.shared.notificationCenter
-        for name in [NSWorkspace.willSleepNotification, NSWorkspace.didWakeNotification] {
-            self.workspaceObservers
-                .append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                    Task { @MainActor [weak self] in
-                        guard let self, let sleepCycleController = self.sleepCycleController else { return }
-                        if name == NSWorkspace.willSleepNotification {
-                            await sleepCycleController.willSleep(mode: self.resolvedMode)
-                        } else {
-                            await sleepCycleController.didWake(mode: self.resolvedMode)
-                        }
-                    }
-                })
-        }
+        MacGatewayPowerMonitor.shared.start(deferWake: {
+            GatewayProcessManager.shared.gatewayHosting == .app
+        }, onSleep: { [weak self] in
+            GatewayProcessManager.shared.gatewayWillSleep()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.sleepCycleController?.willSleep(mode: self.resolvedMode)
+            }
+        }, onWake: { [weak self] in
+            Task { await GatewayProcessManager.shared.resumeStartAfterWake() }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.sleepCycleController?.didWake(mode: self.resolvedMode)
+            }
+        })
     }
 
     var localEndpointHostLabel: String? {

@@ -314,6 +314,14 @@ restart loop and show the failure with the Gateway log tail. Pausing or quitting
 closes the host lifeline and waits for graceful shutdown before forcing an
 unresponsive process group to exit.
 
+During host sleep and DarkWake (background maintenance wake), the app defers
+starting or restarting its child Gateway until a full wake. It leaves an existing
+child running and preserves the active preference. Startup health checks interrupted
+by sleep get a fresh deadline after wake. This uses the system CPU and graphics
+capabilities, rather than display brightness or screen lock; if macOS does not
+provide the capability property, the app retains its normal startup behavior.
+An independently managed LaunchAgent keeps its own restart policy.
+
 After an app update, including a rebuild with the same public version, the app
 seeds the new runtime and restarts its Gateway in the selected hosting mode.
 The app drains its producer and runs Doctor through the selected runtime before

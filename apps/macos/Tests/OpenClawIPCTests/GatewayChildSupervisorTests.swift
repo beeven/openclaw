@@ -100,6 +100,67 @@ struct GatewayChildSupervisorTests {
             allowUnconfigured: false)
     }
 
+    @Test func `DarkWake defers initial launch without consuming the next awake start`() async throws {
+        let capabilities = GatewayPowerTestCapabilities(1)
+        let power = MacGatewayPowerMonitor(capabilities: { capabilities.value })
+        let child = FakeGatewayChild(pid: 901)
+        var launches = 0
+        let supervisor = GatewayChildSupervisor(canLaunch: { power.allowsGatewayLaunch }, launcher: { _ in
+            launches += 1
+            return child.child
+        })
+        do {
+            _ = try await supervisor.start(configuration: self.configuration()) { _ in }
+            Issue.record("DarkWake must not create a child")
+        } catch { #expect(error is GatewayChildSupervisor.DeferredForPower) }
+        #expect(launches == 0)
+        #expect(!supervisor.isActive)
+
+        capabilities.value = 3
+        let pid = try await supervisor.start(configuration: self.configuration()) { _ in }
+        #expect(pid == 901)
+        #expect(launches == 1)
+        await supervisor.stop()
+    }
+
+    @Test(arguments: [false, true])
+    func `DarkWake defers crash recovery including a backoff already in progress`(duringBackoff: Bool) async throws {
+        let capabilities = GatewayPowerTestCapabilities(3)
+        let power = MacGatewayPowerMonitor(capabilities: { capabilities.value })
+        let clock = ManualTestClock()
+        var children: [FakeGatewayChild] = []
+        let supervisor = GatewayChildSupervisor(
+            clock: clock,
+            canLaunch: { power.allowsGatewayLaunch },
+            launcher: { _ in
+                let child = FakeGatewayChild(pid: Int32(910 + children.count))
+                children.append(child)
+                return child.child
+            })
+        let (events, continuation) = AsyncStream<GatewayChildSupervisor.Event>.makeStream()
+        defer { continuation.finish() }
+        var iterator = events.makeAsyncIterator()
+        _ = try await supervisor.start(configuration: self.configuration()) { continuation.yield($0) }
+        if !duringBackoff { capabilities.value = 1 }
+        // Changing power state leaves a live child alone; only its exit starts recovery.
+        #expect(children[0].terminations.withLock { $0 } == 0)
+        children[0].exited.open()
+        if duringBackoff {
+            #expect(await iterator.next() == .restarting(delay: .seconds(1)))
+            await clock.waitForSleep(until: clock.now + .seconds(1))
+            capabilities.value = 1
+            clock.advance(by: .seconds(1))
+        }
+        #expect(await iterator.next() == .deferredForPower)
+        #expect(children.count == 1)
+        #expect(!supervisor.isActive)
+
+        capabilities.value = 3
+        _ = try await supervisor.start(configuration: self.configuration()) { continuation.yield($0) }
+        #expect(children.count == 2)
+        await supervisor.stop()
+    }
+
     @Test func `child keeps profile and SQLite while dropping inherited service ownership`() {
         let configuration = GatewayChildSupervisor.Configuration(
             bun: URL(fileURLWithPath: "/fixture/runtime/current/bin/bun"),

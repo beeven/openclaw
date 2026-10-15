@@ -55,8 +55,11 @@ final class GatewayChildSupervisor {
         /// Initial startup returns its PID directly; this event is only for automatic restarts.
         case started(Int32)
         case restarting(delay: Duration)
+        case deferredForPower
         case failed(String)
     }
+
+    struct DeferredForPower: Error {}
 
     typealias Launcher = @MainActor (Configuration) throws -> Child
 
@@ -66,6 +69,7 @@ final class GatewayChildSupervisor {
     }
 
     private let launcher: Launcher
+    private let canLaunch: @MainActor () -> Bool
     private let clock: any Clock<Duration>
     private let elapsedTime: @Sendable () -> Duration
     private var child: Child?
@@ -76,11 +80,13 @@ final class GatewayChildSupervisor {
 
     init(
         clock: any Clock<Duration> = ContinuousClock(),
+        canLaunch: @escaping @MainActor () -> Bool = { true },
         launcher: @escaping Launcher = GatewayChildSupervisor.launch)
     {
         self.clock = clock
         self.elapsedTime = Self.elapsedTime(clock: clock)
         self.launcher = launcher
+        self.canLaunch = canLaunch
     }
 
     private static func elapsedTime<C: Clock>(clock: C) -> @Sendable () -> Duration where C.Duration == Duration {
@@ -95,6 +101,7 @@ final class GatewayChildSupervisor {
         if let stopTask { await stopTask.value }
         if let processIdentifier { return processIdentifier }
         guard self.child == nil, self.monitorTask == nil else { throw CancellationError() }
+        guard self.canLaunch() else { throw DeferredForPower() }
         self.generation &+= 1
         let generation = self.generation
         let child = try self.launcher(configuration)
@@ -154,6 +161,11 @@ final class GatewayChildSupervisor {
         while self.generation == generation, !Task.isCancelled {
             self.child = nil
             self.processIdentifier = nil
+            guard self.canLaunch() else {
+                self.monitorTask = nil
+                onEvent(.deferredForPower)
+                return
+            }
             if let healthySince, self.elapsedTime() - healthySince >= .seconds(60) {
                 fastFailures = 0
             }
@@ -170,6 +182,11 @@ final class GatewayChildSupervisor {
             onEvent(.restarting(delay: delay))
             do { try await self.clock.sleep(for: delay) } catch { return }
             guard self.generation == generation, !Task.isCancelled else { return }
+            guard self.canLaunch() else {
+                self.monitorTask = nil
+                onEvent(.deferredForPower)
+                return
+            }
             do {
                 child = try self.launcher(configuration)
                 self.child = child
