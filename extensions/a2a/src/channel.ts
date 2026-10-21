@@ -965,10 +965,12 @@ export const a2aChannelPlugin: ChannelPlugin<ResolvedA2aChannelAccount> = create
               const taskId = decodeURIComponent(taskMatch[1] ?? "");
               const action = taskMatch[2];
               if (action === "cancel" && method === "POST") {
+                // The path-bound id wins over any id in the body, matching the
+                // gRPC transcoding rule that path fields are removed from it.
                 return await executeA2aMethod(
                   methodContext,
                   { method: "CancelTask" },
-                  { id: taskId, ...((await readBody()) as object) },
+                  { ...((await readBody()) as object), id: taskId },
                 );
               }
               if (action === "subscribe" && (method === "GET" || method === "POST")) {
@@ -995,10 +997,16 @@ export const a2aChannelPlugin: ChannelPlugin<ResolvedA2aChannelAccount> = create
               const taskId = decodeURIComponent(pushMatch[1] ?? "");
               const configId = pushMatch[2] ? decodeURIComponent(pushMatch[2]) : undefined;
               if (!configId && method === "POST") {
+                // §CreateTaskPushNotificationConfig maps `taskId` to the path
+                // (`post: "/tasks/{task_id=*}/pushNotificationConfigs"`, body:
+                // "*"), so a compliant body carries only {id, url, ...}. The
+                // path wins over any taskId a peer also puts in the body, the
+                // same precedence gRPC transcoding gives path-bound fields.
+                const body = (await readBody()) as Record<string, unknown>;
                 return await executeA2aMethod(
                   methodContext,
                   { method: "CreateTaskPushNotificationConfig", capability: "pushNotifications" },
-                  await readBody(),
+                  { ...(body && typeof body === "object" ? body : {}), taskId },
                 );
               }
               if (!configId && method === "GET") {

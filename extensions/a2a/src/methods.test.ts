@@ -406,7 +406,8 @@ describe("A2A agent card caching", () => {
   });
 });
 
-describe("A2A 0.3 method aliases", () => {  it("resolves every dotted-era alias to its canonical method", async () => {
+describe("A2A 0.3 method aliases", () => {
+  it("resolves every dotted-era alias to its canonical method", async () => {
     const { post, taskStore } = await startHarness();
     const task = taskStore.create("ctx-alias", "alpha");
     taskStore.complete(task.id, "done");
@@ -556,10 +557,14 @@ describe("A2A HTTP+JSON/REST binding", () => {
     const created = await run({
       method: "POST",
       path: `/a2a/v1/rest/tasks/${task.id}/pushNotificationConfigs`,
-      body: { taskId: task.id, url: "https://peer.example.test/webhook" },
+      // §CreateTaskPushNotificationConfig binds taskId to the path; a compliant
+      // body carries only the config fields. A stale taskId in the body must
+      // not win over the path (gRPC transcoding removes path fields from it).
+      body: { taskId: "wrong-task-from-body", url: "https://peer.example.test/webhook" },
       token: "alpha-secret",
     });
     await expect(created.json()).resolves.toMatchObject({
+      taskId: task.id,
       id: expect.any(String),
       url: "https://peer.example.test/webhook",
     });
