@@ -191,6 +191,33 @@ describe("A2A task store", () => {
     expect(states).toContain("TASK_STATE_COMPLETED");
   });
 
+  it("does not regress the state sequence when a reused messageId lands on a completed task", async () => {
+    const store = createTaskStore();
+    const first = store.create("ctx-dup", "alice", "reused-message");
+    store.start(first.id);
+    store.complete(first.id, "done");
+
+    // Same (ownerPeer, messageId) idempotently returns the completed task.
+    const second = store.create("ctx-dup", "alice", "reused-message");
+    expect(second.id).toBe(first.id);
+
+    const frames: A2aStreamResponse[] = [];
+    for await (const frame of store.stream(second.id, "alice")) {
+      frames.push(frame);
+    }
+    const states = frames
+      .filter(
+        (frame): frame is { task: never; statusUpdate: { status: { state: string } } } =>
+          "statusUpdate" in frame,
+      )
+      .map((frame) => frame.statusUpdate.status.state);
+
+    // A completed-task snapshot yielded before the replayed events would put
+    // COMPLETED before WORKING; the replay sequence must stand alone and stay
+    // in generation order (STREAM-ORDER-001).
+    expect(states).toEqual(["TASK_STATE_WORKING", "TASK_STATE_COMPLETED"]);
+  });
+
   it("resolves a blocking wait when the task pauses for input", async () => {
     const store = createTaskStore();
     const task = store.create("ctx-input", "alice");

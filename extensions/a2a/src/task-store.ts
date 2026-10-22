@@ -255,8 +255,12 @@ export class A2aTaskStore {
   /**
    * Stream task updates (spec §3.1.2 / §3.1.6).
    *
-   * The first frame is always the current Task snapshot — that is what prevents a
-   * peer from missing an update between `GetTask` and subscribing. The stream
+   * The first frame is the current Task snapshot while the task is live —
+   * that is what prevents a peer from missing an update between `GetTask`
+   * and subscribing. A terminal task with buffered history replays those
+   * events instead: a completed-task snapshot (e.g. a `messageId` reuse
+   * landing on an existing task) yielded before them would regress the
+   * state sequence (spec §3.5.2, events in generation order). The stream
    * ends once the task reaches a terminal state.
    */
   async *stream(
@@ -268,18 +272,26 @@ export class A2aTaskStore {
     if (!task) {
       throw taskNotFound("Task not found", taskId);
     }
-    // Subscribe before the first yield: an event published while the snapshot
+    // Subscribe before the first yield: an event published while the first
     // frame is in flight must land in this queue, not be missed. The queue is
     // seeded with the replay buffer so a late subscriber still observes every
     // transition since `submitted`.
+    const replay = [...(this.#replayBuffers.get(taskId) ?? [])];
     const queue: A2aTaskEventQueue = {
-      events: [...(this.#replayBuffers.get(taskId) ?? [])],
+      events: replay,
       waiters: new Set(),
       closed: false,
     };
     this.#subscribeQueue(taskId, queue);
     try {
-      yield { task: cloneTask(task) };
+      // A terminal-task snapshot yielded ahead of the replayed events would
+      // regress the state sequence (STREAM-ORDER-001): the buffer still
+      // holds the earlier `working` transitions. A live task's snapshot
+      // cannot regress — `submitted` is never published, and the interrupted
+      // states share the working order — so it stays the first frame.
+      if (replay.length === 0 || !isTerminalTaskState(task.status.state)) {
+        yield { task: cloneTask(task) };
+      }
       // A task that never settles must not pin an HTTP response open forever. The
       // deadline bounds one stream; the peer can reconnect with SubscribeToTask.
       const deadline =
