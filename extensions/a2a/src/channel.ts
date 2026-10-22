@@ -216,13 +216,23 @@ export const a2aChannelPlugin: ChannelPlugin<ResolvedA2aChannelAccount> = create
               if (!ownerPeer) {
                 return;
               }
+              // Configs are resolved at delivery time, not capture time: a
+              // registration deleted between the event and the webhook attempt
+              // must not still receive it.
               pushSender.notify({
                 task,
-                configs: pushConfigs.forTask(ownerPeer, task.id),
+                resolveConfigs: () => pushConfigs.forTask(ownerPeer, task.id),
                 event,
               });
             })
           : () => undefined;
+        // Push registrations expire with their task: retention pruning evicts
+        // terminal tasks, and their webhooks must not outlive them.
+        const stopEvictionObserver = store.onTaskEvicted(({ taskId, ownerPeer }) => {
+          if (ownerPeer !== undefined) {
+            pushConfigs.deleteForTask(ownerPeer, taskId);
+          }
+        });
         const unregisterRoutes: Array<() => void> = [];
 
         const handler = createA2aHttpHandler({
@@ -283,6 +293,7 @@ export const a2aChannelPlugin: ChannelPlugin<ResolvedA2aChannelAccount> = create
             unregister();
           }
           stopPushObserver();
+          stopEvictionObserver();
           pushSender?.reset();
           pushConfigs.clear();
           store.stop();

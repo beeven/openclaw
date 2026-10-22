@@ -64,6 +64,8 @@ export class A2aPushSender {
   readonly #policy: SsrFPolicy;
   /** One in-flight chain per task keeps notifications for a task ordered. */
   readonly #chains = new Map<string, Promise<void>>();
+  /** Set by `reset()`: queued work from a stopped channel must not deliver. */
+  #closed = false;
 
   constructor(params: { settings?: A2aPushNotificationSettings; log?: A2aPushSenderLogger }) {
     // Settings are folded into the SSRF policy here rather than kept around:
@@ -74,37 +76,46 @@ export class A2aPushSender {
 
   notify(params: {
     task: A2aTask;
-    configs: A2aPushNotificationConfig[];
+    /**
+     * Resolved at the delivery boundary, not when the event fires: a
+     * registration deleted while this notification sat queued behind a slow
+     * receiver must not receive (or be charged for) the update.
+     */
+    resolveConfigs: () => A2aPushNotificationConfig[];
     event: A2aStreamResponse;
   }): void {
-    if (params.configs.length === 0) {
+    if (this.#closed) {
       return;
     }
     const previous = this.#chains.get(params.task.id) ?? Promise.resolve();
     const next = previous
       .catch(() => undefined)
       .then(async () => {
-        for (const config of params.configs) {
+        if (this.#closed) {
+          return;
+        }
+        for (const config of params.resolveConfigs()) {
           await this.#deliver(config, params.event);
         }
       })
       .catch((error: unknown) => {
         this.#log(`a2a push notification failed for task ${params.task.id}: ${String(error)}`);
       });
-    this.#chains.set(
-      params.task.id,
-      next.finally(() => {
-        if (this.#chains.get(params.task.id) === next) {
-          this.#chains.delete(params.task.id);
-        }
-      }),
-    );
+    const chained = next.finally(() => {
+      if (this.#chains.get(params.task.id) === chained) {
+        this.#chains.delete(params.task.id);
+      }
+    });
+    this.#chains.set(params.task.id, chained);
   }
 
   async #deliver(config: A2aPushNotificationConfig, event: A2aStreamResponse): Promise<void> {
     const body = JSON.stringify(event);
     const headers = buildPushHeaders(config);
     for (let attempt = 1; attempt <= A2A_PUSH_MAX_ATTEMPTS; attempt += 1) {
+      if (this.#closed) {
+        return;
+      }
       try {
         const { response, release } = await fetchWithSsrFGuard({
           url: config.url,
@@ -121,7 +132,12 @@ export class A2aPushSender {
             return;
           }
           // 4xx (except 408/429) means the receiver rejected it; retrying cannot help.
-          if (response.status >= 400 && response.status < 500 && response.status !== 408) {
+          if (
+            response.status >= 400 &&
+            response.status < 500 &&
+            response.status !== 408 &&
+            response.status !== 429
+          ) {
             this.#log(
               `a2a push notification to ${config.url} rejected (HTTP ${response.status}); dropping`,
             );
@@ -143,8 +159,9 @@ export class A2aPushSender {
     this.#log(`a2a push notification to ${config.url} exhausted ${A2A_PUSH_MAX_ATTEMPTS} attempts`);
   }
 
-  /** Drop in-flight bookkeeping; used when the channel stops. */
+  /** Stop the sender: queued deliveries abort before their next network attempt. */
   reset(): void {
+    this.#closed = true;
     this.#chains.clear();
   }
 }

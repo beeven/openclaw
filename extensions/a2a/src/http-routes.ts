@@ -307,6 +307,13 @@ export function createA2aHttpHandler(deps: A2aHttpRoutesDeps) {
       });
     };
 
+    if (isRateLimited(peerName)) {
+      // Streaming must not sidestep the per-peer limiter that governs unary
+      // requests; the refusal is emitted before the SSE stream opens.
+      fail(new A2aProtocolError(-32000, "Peer is rate limited"));
+      return;
+    }
+
     if (!parsed.success) {
       fail(
         new A2aProtocolError(A2A_JSON_RPC_ERROR_CODES.INVALID_REQUEST, "Invalid JSON-RPC request"),
@@ -428,7 +435,7 @@ export function createA2aHttpHandler(deps: A2aHttpRoutesDeps) {
 
     if (a2aConfig.rest?.enabled === true && pathname.startsWith(`${A2A_REST_PATH}/`)) {
       return await handleA2aRestRequest(
-        { a2aConfig, createMethodContext },
+        { a2aConfig, createMethodContext, isRateLimited },
         request,
         response,
         pathname,
@@ -476,7 +483,11 @@ export function createA2aHttpHandler(deps: A2aHttpRoutesDeps) {
         );
         return true;
       }
+      // Even pre-parse rejections keep the JSON-RPC envelope (§5): a peer
+      // must never receive a bare error object from this endpoint.
       writeJsonResponse(response, 200, {
+        jsonrpc: "2.0",
+        id: null,
         error: toRpcErrorObject(error),
       });
       return true;

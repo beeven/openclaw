@@ -1,7 +1,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { readRequestBodyWithLimit } from "openclaw/plugin-sdk/webhook-ingress";
-import { A2A_JSON_RPC_ERROR_CODES, methodNotFound } from "./a2a-errors.js";
+import { A2A_JSON_RPC_ERROR_CODES, invalidParams, methodNotFound } from "./a2a-errors.js";
 import { A2A_REST_PATH } from "./agent-card.js";
 import { toRpcErrorObject, writeJsonResponse } from "./http-json.js";
 import { executeA2aMethod, streamA2aMethod, type A2aMethodContext } from "./methods.js";
@@ -102,6 +102,11 @@ export type A2aRestHandlerDeps = {
   a2aConfig: A2aChannelConfig;
   /** Builds the per-request method context (peer, request, stores). */
   createMethodContext: (params: { request: IncomingMessage; peerName: string }) => A2aMethodContext;
+  /**
+   * Shares the JSON-RPC endpoint's per-peer limiter, so the REST binding
+   * cannot be used to sidestep it (spec treats both as one protocol surface).
+   */
+  isRateLimited: (peerName: string) => boolean;
 };
 
 /**
@@ -120,6 +125,19 @@ export async function handleA2aRestRequest(
   const peerName = resolvePeerName(request, deps.a2aConfig);
   if (!peerName) {
     writeJsonResponse(response, 401, { error: "Unauthorized" });
+    return true;
+  }
+  if (deps.isRateLimited(peerName)) {
+    // §5.4 maps RESOURCE_EXHAUSTED to HTTP 429; the ProtoJSON body carries
+    // the gRPC status name like every other REST error here.
+    writeJsonResponse(response, 429, {
+      error: {
+        code: 429,
+        status: "RESOURCE_EXHAUSTED",
+        message: "Peer is rate limited",
+        details: [],
+      },
+    });
     return true;
   }
   const method = request.method ?? "GET";
@@ -192,7 +210,17 @@ async function runRestRoute(params: {
       maxBytes: MAX_REQUEST_BODY_BYTES,
       destroyOnLimit: false,
     });
-    return raw.trim() ? JSON.parse(raw) : {};
+    if (!raw.trim()) {
+      return {};
+    }
+    try {
+      return JSON.parse(raw);
+    } catch {
+      // A malformed body is a request problem, not a transport one: report it
+      // as INVALID_ARGUMENT instead of a bare SyntaxError (which would render
+      // as an opaque 500).
+      throw invalidParams("Request body is not valid JSON");
+    }
   };
   // No `id` parameter: the REST binding emits bare `StreamResponse`
   // frames with no JSON-RPC envelope to correlate (§11.5).
@@ -253,6 +281,9 @@ async function runRestRoute(params: {
       {
         ...(query.get("contextId") ? { contextId: query.get("contextId") } : {}),
         ...(query.get("status") ? { status: query.get("status") } : {}),
+        ...(query.get("statusTimestampAfter")
+          ? { statusTimestampAfter: query.get("statusTimestampAfter") }
+          : {}),
         ...(query.get("pageSize") ? { pageSize: Number(query.get("pageSize")) } : {}),
         ...(query.get("pageToken") ? { pageToken: query.get("pageToken") } : {}),
         ...(query.get("historyLength")
@@ -318,6 +349,17 @@ async function runRestRoute(params: {
         methodContext,
         { method: "CreateTaskPushNotificationConfig", capability: "pushNotifications" },
         { ...body, taskId },
+      );
+    }
+    if (!configId && method === "GET") {
+      return await executeA2aMethod(
+        methodContext,
+        { method: "ListTaskPushNotificationConfigs", capability: "pushNotifications" },
+        {
+          taskId,
+          ...(query.get("pageSize") ? { pageSize: Number(query.get("pageSize")) } : {}),
+          ...(query.get("pageToken") ? { pageToken: query.get("pageToken") } : {}),
+        },
       );
     }
     if (configId && method === "GET") {

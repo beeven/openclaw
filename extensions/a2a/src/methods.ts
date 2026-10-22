@@ -307,6 +307,9 @@ export async function executeA2aMethod(
         ownerPeer: ctx.peerName,
         ...(parsed.data.contextId !== undefined ? { contextId: parsed.data.contextId } : {}),
         ...(parsed.data.status ? { status: parsed.data.status } : {}),
+        ...(parsed.data.statusTimestampAfter
+          ? { statusTimestampAfter: parsed.data.statusTimestampAfter }
+          : {}),
         ...(parsed.data.pageSize !== undefined ? { pageSize: parsed.data.pageSize } : {}),
         ...(parsed.data.pageToken ? { pageToken: parsed.data.pageToken } : {}),
         ...(parsed.data.historyLength !== undefined

@@ -56,6 +56,15 @@ export type A2aTaskEventObserver = (params: {
   ownerPeer: string | undefined;
 }) => void;
 
+/**
+ * Fired when a terminal task is evicted from retention, so stores keyed by
+ * task (e.g. push notification registrations) can expire with their task.
+ */
+export type A2aTaskEvictionObserver = (params: {
+  taskId: string;
+  ownerPeer: string | undefined;
+}) => void;
+
 function cloneTask(task: A2aTask): A2aTask {
   return structuredClone(task);
 }
@@ -76,8 +85,21 @@ export class A2aTaskStore {
   readonly #taskMessageKeys = new Map<string, string>();
   readonly #terminalTasks = new Map<string, number>();
   readonly #waiters = new Map<string, Set<A2aTaskWaiter>>();
-  readonly #queues = new Map<string, A2aTaskEventQueue>();
+  /**
+   * One queue per subscriber, not per task: concurrent `SendStreamingMessage`
+   * and `SubscribeToTask` streams each consume the full event sequence, so a
+   * shared queue would let one subscriber steal frames from the other.
+   */
+  readonly #queues = new Map<string, Set<A2aTaskEventQueue>>();
+  /**
+   * Replay buffer per task, kept from creation so a subscriber that arrives a
+   * tick late still sees every transition since `submitted`. Each new queue is
+   * seeded with a copy; live events then flow into the buffer and every live
+   * queue alike.
+   */
+  readonly #replayBuffers = new Map<string, A2aStreamResponse[]>();
   readonly #observers = new Set<A2aTaskEventObserver>();
+  readonly #evictionObservers = new Set<A2aTaskEvictionObserver>();
 
   create(contextId: string, ownerPeer?: string, messageId?: string): A2aTask {
     this.#pruneTerminalTasks();
@@ -94,6 +116,9 @@ export class A2aTaskStore {
       history: [],
     };
     this.#tasks.set(task.id, task);
+    // Reserve the replay buffer before any work can publish, so a stream
+    // opened after dispatch still replays every event the task produced.
+    this.#replayBuffers.set(task.id, []);
     if (ownerPeer !== undefined) {
       this.#taskOwners.set(task.id, ownerPeer);
     }
@@ -101,9 +126,6 @@ export class A2aTaskStore {
       this.#messageTasks.set(messageKey, task);
       this.#taskMessageKeys.set(task.id, messageKey);
     }
-    // Reserve the mailbox before any work can publish, so a stream opened after
-    // dispatch still replays every event the task produced.
-    this.#queueFor(task.id);
     return task;
   }
 
@@ -212,7 +234,9 @@ export class A2aTaskStore {
   }
 
   wait(task: A2aTask, timeoutMs: number): Promise<A2aTask> {
-    if (isTerminalTaskState(task.status.state)) {
+    // Interrupted states resolve immediately too: the task is waiting on the
+    // peer, so holding the response open would hide the question it must answer.
+    if (isTerminalTaskState(task.status.state) || isInterruptedTaskState(task.status.state)) {
       return Promise.resolve(task);
     }
     const taskId = task.id;
@@ -244,19 +268,25 @@ export class A2aTaskStore {
     if (!task) {
       throw taskNotFound("Task not found", taskId);
     }
-    yield { task: cloneTask(task) };
-    const queue = this.#queueFor(taskId);
-    // A task that never settles must not pin an HTTP response open forever. The
-    // deadline bounds one stream; the peer can reconnect with SubscribeToTask.
-    const deadline =
-      options.timeoutMs !== undefined && options.timeoutMs > 0
-        ? Date.now() + options.timeoutMs
-        : undefined;
+    // Subscribe before the first yield: an event published while the snapshot
+    // frame is in flight must land in this queue, not be missed. The queue is
+    // seeded with the replay buffer so a late subscriber still observes every
+    // transition since `submitted`.
+    const queue: A2aTaskEventQueue = {
+      events: [...(this.#replayBuffers.get(taskId) ?? [])],
+      waiters: new Set(),
+      closed: false,
+    };
+    this.#subscribeQueue(taskId, queue);
     try {
+      yield { task: cloneTask(task) };
+      // A task that never settles must not pin an HTTP response open forever. The
+      // deadline bounds one stream; the peer can reconnect with SubscribeToTask.
+      const deadline =
+        options.timeoutMs !== undefined && options.timeoutMs > 0
+          ? Date.now() + options.timeoutMs
+          : undefined;
       while (true) {
-        // Buffered events drain before any terminal check: a task can reach its
-        // terminal state before the subscriber attaches, and the updates it
-        // already produced must still reach the peer.
         const next = queue.events.shift();
         if (next) {
           yield next;
@@ -280,9 +310,9 @@ export class A2aTaskStore {
         await raceWithTimeout(this.#awaitEvent(queue), remaining, () => undefined);
       }
     } finally {
-      // A consumer that stops iterating (client disconnect) must not leave the
-      // mailbox holding frames for a stream nobody reads.
-      this.#releaseQueueIfIdle(taskId);
+      // A consumer that stops iterating (client disconnect) releases its own
+      // queue; other subscribers keep theirs.
+      this.#unsubscribeQueue(taskId, queue);
     }
   }
 
@@ -294,10 +324,19 @@ export class A2aTaskStore {
     };
   }
 
+  /** Observe task evictions, so task-keyed stores expire with their tasks. */
+  onTaskEvicted(observer: A2aTaskEvictionObserver): () => void {
+    this.#evictionObservers.add(observer);
+    return () => {
+      this.#evictionObservers.delete(observer);
+    };
+  }
+
   listTasks(params: {
     ownerPeer: string;
     contextId?: string;
     status?: A2aTaskState;
+    statusTimestampAfter?: string;
     pageSize?: number;
     pageToken?: string;
     historyLength?: number;
@@ -313,6 +352,14 @@ export class A2aTaskStore {
         continue;
       }
       if (params.status !== undefined && task.status.state !== params.status) {
+        continue;
+      }
+      // RFC 3339 timestamps compare correctly as strings when both sides use
+      // the same `toISOString()` rendering.
+      if (
+        params.statusTimestampAfter !== undefined &&
+        (task.status.timestamp ?? "") <= params.statusTimestampAfter
+      ) {
         continue;
       }
       matches.push(task);
@@ -350,11 +397,14 @@ export class A2aTaskStore {
     this.#terminalTasks.clear();
     this.#taskOwners.clear();
     this.#tasks.clear();
-    for (const queue of this.#queues.values()) {
-      queue.closed = true;
-      this.#notifyWaiters(queue);
+    for (const subscribers of this.#queues.values()) {
+      for (const queue of subscribers) {
+        queue.closed = true;
+        this.#notifyWaiters(queue);
+      }
     }
     this.#queues.clear();
+    this.#replayBuffers.clear();
     this.#waiters.clear();
   }
 
@@ -366,6 +416,15 @@ export class A2aTaskStore {
     const message = createStatusMessage(task.contextId, reason);
     task.status = { state, timestamp: new Date().toISOString(), message };
     task.history.push(message);
+    // A blocking SendMessage must return once the task pauses for input: the
+    // peer needs the question before it can continue (spec §3.1.8 / §7.6).
+    const waiters = this.#waiters.get(task.id);
+    if (waiters) {
+      this.#waiters.delete(task.id);
+      for (const resolve of waiters) {
+        resolve(task);
+      }
+    }
     // Interrupted tasks keep their stream open: the peer needs the update, and it
     // may resume the same task with another message.
     this.#publish(task, {
@@ -441,13 +500,25 @@ export class A2aTaskStore {
   }
 
   #publish(task: A2aTask, event: A2aStreamResponse): void {
-    const queue = this.#queues.get(task.id);
-    if (queue && !queue.closed) {
-      queue.events.push(event);
-      if (queue.events.length > A2A_MAX_BUFFERED_EVENTS) {
-        queue.events.splice(0, queue.events.length - A2A_MAX_BUFFERED_EVENTS);
+    const replay = this.#replayBuffers.get(task.id);
+    if (replay) {
+      replay.push(event);
+      if (replay.length > A2A_MAX_BUFFERED_EVENTS) {
+        replay.splice(0, replay.length - A2A_MAX_BUFFERED_EVENTS);
       }
-      this.#notifyWaiters(queue);
+    }
+    const subscribers = this.#queues.get(task.id);
+    if (subscribers) {
+      for (const queue of subscribers) {
+        if (queue.closed) {
+          continue;
+        }
+        queue.events.push(event);
+        if (queue.events.length > A2A_MAX_BUFFERED_EVENTS) {
+          queue.events.splice(0, queue.events.length - A2A_MAX_BUFFERED_EVENTS);
+        }
+        this.#notifyWaiters(queue);
+      }
     }
     const ownerPeer = this.#taskOwners.get(task.id);
     for (const observer of this.#observers) {
@@ -459,19 +530,34 @@ export class A2aTaskStore {
     }
   }
 
-  #queueFor(taskId: string): A2aTaskEventQueue {
-    const queue = this.#queues.get(taskId) ?? { events: [], waiters: new Set(), closed: false };
-    this.#queues.set(taskId, queue);
-    return queue;
+  #subscribeQueue(taskId: string, queue: A2aTaskEventQueue): void {
+    const subscribers = this.#queues.get(taskId) ?? new Set<A2aTaskEventQueue>();
+    subscribers.add(queue);
+    this.#queues.set(taskId, subscribers);
+  }
+
+  #unsubscribeQueue(taskId: string, queue: A2aTaskEventQueue): void {
+    const subscribers = this.#queues.get(taskId);
+    if (!subscribers) {
+      return;
+    }
+    subscribers.delete(queue);
+    // The task entry stays as long as any subscriber remains or the task is
+    // still live; terminal tasks drop theirs in #pruneTerminalTasks.
+    if (subscribers.size === 0 && !this.#tasks.has(taskId)) {
+      this.#queues.delete(taskId);
+    }
   }
 
   #closeQueue(taskId: string): void {
-    const queue = this.#queues.get(taskId);
-    if (!queue) {
+    const subscribers = this.#queues.get(taskId);
+    if (!subscribers) {
       return;
     }
-    queue.closed = true;
-    this.#notifyWaiters(queue);
+    for (const queue of subscribers) {
+      queue.closed = true;
+      this.#notifyWaiters(queue);
+    }
   }
 
   #notifyWaiters(queue: A2aTaskEventQueue): void {
@@ -488,32 +574,32 @@ export class A2aTaskStore {
     });
   }
 
-  #releaseQueueIfIdle(taskId: string): void {
-    const queue = this.#queues.get(taskId);
-    if (!queue) {
-      return;
-    }
-    // Keep buffered frames: a resubscribe must replay them for a reconnecting peer.
-    if (queue.waiters.size === 0 && queue.events.length === 0 && queue.closed) {
-      this.#queues.delete(taskId);
-    }
-  }
-
   #pruneTerminalTasks(): void {
     const expiresBefore = Date.now() - A2A_TERMINAL_RETENTION_MS;
     for (const [taskId, finishedAt] of this.#terminalTasks) {
       if (finishedAt > expiresBefore && this.#terminalTasks.size <= A2A_TERMINAL_MAX_TASKS) {
         break;
       }
+      const ownerPeer = this.#taskOwners.get(taskId);
       const messageKey = this.#taskMessageKeys.get(taskId);
       if (messageKey !== undefined) {
         this.#messageTasks.delete(messageKey);
         this.#taskMessageKeys.delete(taskId);
       }
       this.#queues.delete(taskId);
+      this.#replayBuffers.delete(taskId);
       this.#terminalTasks.delete(taskId);
       this.#taskOwners.delete(taskId);
       this.#tasks.delete(taskId);
+      // Task-keyed stores (e.g. push notification registrations) must expire
+      // with their task, or they leak webhooks for tasks that no longer exist.
+      for (const observer of this.#evictionObservers) {
+        try {
+          observer({ taskId, ownerPeer });
+        } catch {
+          // Eviction observers must never break retention pruning.
+        }
+      }
     }
   }
 }

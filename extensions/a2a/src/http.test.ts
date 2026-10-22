@@ -159,7 +159,8 @@ async function startHttpHarness(options?: {
     baseUrl,
     taskStore,
     handler,
-    get: (endpoint: string) => dispatchRequest({ method: "GET", endpoint }),
+    request: dispatchRequest,
+    get: (endpoint: string, token?: string) => dispatchRequest({ method: "GET", endpoint, token }),
     post: (body: unknown, token: string | null = "alpha-secret") =>
       dispatchRequest({
         method: "POST",
@@ -824,6 +825,66 @@ describe("A2A HTTP authentication with unresolved token references", () => {
       );
       // Only the resolved peer reached the agent; the forged request created no task.
       expect(dispatched).toEqual(["kept"]);
+    });
+  });
+});
+
+describe("A2A REST binding", () => {
+  it("creates and lists push notification configs for a task", async () => {
+    const harness = await startHttpHarness({
+      a2aConfig: {
+        rest: { enabled: true },
+        capabilities: { pushNotifications: true },
+      },
+    });
+    const sent = await harness.post(sendRequest({ returnImmediately: true }));
+    const taskId = ((await sent.json()) as { result: { task: { id: string } } }).result.task.id;
+
+    const created = await harness.request({
+      method: "POST",
+      endpoint: `/a2a/v1/rest/tasks/${taskId}/pushNotificationConfigs`,
+      body: JSON.stringify({ url: "https://hooks.example.test/notify" }),
+      token: "alpha-secret",
+    });
+    expect(created.status).toBe(200);
+
+    const listed = await harness.get(
+      `/a2a/v1/rest/tasks/${taskId}/pushNotificationConfigs`,
+      "alpha-secret",
+    );
+    expect(listed.status).toBe(200);
+    await expect(listed.json()).resolves.toMatchObject({
+      configs: [{ taskId, url: "https://hooks.example.test/notify" }],
+    });
+  });
+
+  it("shares the per-peer rate limit with the JSON-RPC endpoint", async () => {
+    const harness = await startHttpHarness({
+      a2aConfig: { rest: { enabled: true }, rateLimitPerMinute: 1 },
+    });
+
+    const first = await harness.get("/a2a/v1/rest/tasks", "alpha-secret");
+    expect(first.status).toBe(200);
+
+    const second = await harness.get("/a2a/v1/rest/tasks", "alpha-secret");
+    expect(second.status).toBe(429);
+    await expect(second.json()).resolves.toMatchObject({
+      error: { code: 429, status: "RESOURCE_EXHAUSTED" },
+    });
+  });
+
+  it("classifies a malformed REST body as INVALID_ARGUMENT, not an internal error", async () => {
+    const harness = await startHttpHarness({ a2aConfig: { rest: { enabled: true } } });
+
+    const reply = await harness.request({
+      method: "POST",
+      endpoint: "/a2a/v1/rest/message:send",
+      body: '{"unterminated": ',
+      token: "alpha-secret",
+    });
+    expect(reply.status).toBe(400);
+    await expect(reply.json()).resolves.toMatchObject({
+      error: { status: "INVALID_ARGUMENT" },
     });
   });
 });
