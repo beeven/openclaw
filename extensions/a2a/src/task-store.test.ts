@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { A2aTaskStore } from "./task-store.js";
+import { A2aTaskStore, type A2aStreamResponse } from "./task-store.js";
 
 describe("A2A task store", () => {
   const stores: A2aTaskStore[] = [];
@@ -158,12 +158,10 @@ describe("A2A task store", () => {
     store.start(task.id);
     store.complete(task.id, "done");
 
-    const drain = async (
-      iterator: AsyncGenerator<{ statusUpdate?: { status: { state: string } } }>,
-    ) => {
+    const drain = async (iterator: AsyncGenerator<A2aStreamResponse>) => {
       const states: string[] = [];
       for await (const frame of iterator) {
-        if (frame.statusUpdate) {
+        if ("statusUpdate" in frame && frame.statusUpdate) {
           states.push(frame.statusUpdate.status.state);
         }
       }
